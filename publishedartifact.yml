@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Serverless Webhosting Aritfact
+
+Parameters:
+  SourceCodeBucket:
+    Type: String
+    Description: Name of the S3 bucket containing the Lambda source code
+
+  ACMArn:
+    Type: String
+    Description: Arn of the custom domain certificate from ACM
+
+  DomainName:
+    Type: String
+    Description: Custom domain to be used with the website
+  
+  VPCID:
+    Type: String
+    Description: ID of the VPC the solution components to be placed in
+
+  VPCEIp1:
+    Type: String
+    Description: AZ1 IP address of apigateway VPC endpoint, the VPC endpoint must be in your solution VPC 
+
+  VPCEIp2:
+    Type: String
+    Description: AZ2 IP address of apigateway VPC endpoint, the VPC endpoint must be in your solution VPC
+
+  ALBSG:
+    Type: String
+    Default: 'sg-0d6abfb2e4fd8931d'
+    Description: SG to be assigned to the ALB
+
+  ALBSubnet1:
+    Type: String
+    Default: 'subnet-0aefe790d5c3601f5'
+    Description: AZ1 subnet ID for the ALB, the subnet must be in your solutio VPC
+
+  ALBSubnet2:
+    Type: String
+    Default: 'subnet-01a0fc49d095a64d2'
+    Description: AZ2 subnet ID for the ALB, the subnet must be in your solutio VPC
+
+  CognitoUserPoolID:
+    Type: String
+    Description: The ID of the Cognito user pool to be used to authenticate website user
+  
+  CognitoUserPoolAppID:
+    Type: String
+    Description: The ID of the Cognito user pool app client to be used to authenticate website user
+
+Resources:
+  StaticSiteBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ["*"]
+            ExposedHeaders: [Date]
+            Id: CORSRules
+            MaxAge: 3600
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+
+  APIGatewayS3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: bucket-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource: !Join
+                  - "/"
+                  - - !GetAtt StaticSiteBucket.Arn
+                    - "*"
+
+  TheRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties: 
+      DisableExecuteApiEndpoint: true
+      EndpointConfiguration: 
+        Types: 
+          - PRIVATE
+        VpcEndpointIds: 
+          - vpce-0b5b856002d6dd31e
+      Name: serverless-static-website-api
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal: '*'
+          Action: 'execute-api:Invoke'
+          Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*'
+
+  AuthenticationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties: 
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration: 
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri:
+          !Join
+            - ""
+            - - 'arn:aws:apigateway:'
+              - !Ref AWS::Region
+              - ':lambda:path/2015-03-31/functions/'
+              - !GetAtt AuthLambda.Arn
+              - '/invocations'     
+      ResourceId:
+        !GetAtt TheRestApi.RootResourceId
+      RestApiId: !Ref TheRestApi
+
+  WebsiteContent:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !GetAtt TheRestApi.RootResourceId
+      PathPart: '{item+}'
+      RestApiId: !Ref TheRestApi
+  
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties: 
+      AuthorizerResultTtlInSeconds: 0
+      # IdentitySource: String
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizorLambda.Arn}/invocations'
+      Name: LambdaAuthorizer
+      RestApiId: !Ref TheRestApi
+      Type: REQUEST
+
+  WebsiteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties: 
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      HttpMethod: GET
+      Integration:
+        Credentials: !GetAtt APIGatewayS3AccessRole.Arn
+        IntegrationHttpMethod: GET
+        Type: AWS
+        Uri:
+          !Join
+            - ""
+            - - 'arn:aws:apigateway:'
+              - !Ref AWS::Region
+              - ':s3:path/'
+              - !Ref StaticSiteBucket
+              - '/{item}'
+        RequestParameters:
+          integration.request.header.Content-Disposition: "method.request.header.Content-Disposition"
+          integration.request.path.item: "method.request.path.item"
+          integration.request.header.Content-Type: "method.request.header.Content-Type"
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Content-Disposition: "integration.response.header.Content-Disposition"
+              method.response.header.Content-Type: "integration.response.header.Content-Type"
+            StatusCode: 200
+      ResourceId: !Ref WebsiteContent
+      RestApiId: !Ref TheRestApi
+      RequestParameters:
+        method.request.header.Content-Disposition: false
+        method.request.path.item: true
+        method.request.header.Content-Type: true
+      MethodResponses:
+        - ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Content-Disposition: false
+          StatusCode: 200
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - WebsiteMethod
+      - AuthenticationMethod
+    Properties:
+      RestApiId: !Ref TheRestApi
+      StageName: Test
+
+  APIDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties: 
+      RegionalCertificateArn: !Ref ACMArn
+      DomainName: !Ref DomainName
+      EndpointConfiguration: 
+        Types: 
+          - REGIONAL
+
+  BasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties: 
+      DomainName: !Ref APIDomain
+      RestApiId: !Ref TheRestApi
+      Stage: Test
+  
+  AuthorizorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: authorizorlambda
+      Runtime: python3.8
+      Timeout: 15
+      Role: 
+        !GetAtt LambdaRole.Arn
+      Handler: authorizor.lambda_handler
+      Code:
+        S3Bucket: !Ref SourceCodeBucket
+        S3Key: my-deployment-package.zip
+  
+  AuthorizorLambdaPermission:
+    DependsOn: AuthorizorLambda
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: authorizorlambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TheRestApi}/*'
+  
+  AuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: authlambda
+      Runtime: python3.8
+      Timeout: 15
+      Role: 
+        !GetAtt LambdaRole.Arn
+      Handler: auth.lambda_handler
+      Code:
+        S3Bucket: !Ref SourceCodeBucket
+        S3Key: auth.py.zip
+      
+  LambdaPermission:
+    DependsOn: AuthLambda
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: authlambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TheRestApi}/*'
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      Name: Serverless-Website-ALB
+      Scheme: internet-facing
+      SecurityGroups: 
+        - !Ref ALBSG
+      Subnets: 
+        - !Ref ALBSubnet1
+        - !Ref ALBSubnet2
+      Type: application
+
+  ALBTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: true
+      Matcher:
+        HttpCode: 200,403
+      Name: apigatewa-vpce
+      Port: 443
+      Protocol: HTTPS
+      ProtocolVersion: HTTP1
+      Targets: 
+        - Id: !Ref VPCEIp1
+          Port: 443
+        - Id: !Ref VPCEIp2
+          Port: 443
+      TargetType: ip
+      VpcId: !Ref VPCID
+  
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      Certificates: 
+        - CertificateArn: !Ref ACMArn
+      DefaultActions: 
+        - Type: forward
+          TargetGroupArn: !Ref ALBTG
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+
+Outputs:
+  ALBDNS:
+    Description: DNS of ALB
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: ALBDNS
